@@ -1,0 +1,21 @@
+# Never ship the host's build output or dependencies into the image: they are
+# rebuilt inside it, and a stale incremental build info file copied in here will
+# make TypeScript think there is nothing to compile.
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+backups
+.git
+.gitignore
+.vscode
+.idea
+
+*.log
+npm-debug.log*
+README.md

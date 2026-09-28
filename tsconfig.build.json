@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Pinned so the entry point is always dist/main.js. Without it, TypeScript
+    // infers the common root from whatever is included, and adding a .ts file
+    // under prisma/ or scripts/ would silently move the build to dist/src/.
+    "rootDir": "./src",
+    // Must live inside outDir. Setting rootDir moves the default location to
+    // the project root, where Nest's deleteOutDir cannot clear it — so after
+    // `rm -rf dist` TypeScript reads a stale build info, believes everything is
+    // up to date, and emits nothing at all.
+    "tsBuildInfoFile": "./dist/tsconfig.build.tsbuildinfo"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "prisma", "scripts", "**/*spec.ts"]
+}
