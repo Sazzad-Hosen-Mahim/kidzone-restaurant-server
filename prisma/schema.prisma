@@ -1,0 +1,698 @@
+// Kid Zone + Restaurant management system.
+//
+// Conventions enforced across this schema:
+//  * Every money column is an Int holding POISHA (1 BDT = 100 poisha). Never a float.
+//  * Every timestamp is `timestamptz` (Prisma DateTime maps to timestamptz here via
+//    @db.Timestamptz) stored in UTC.
+//  * `businessDate` is a DATE computed in the business timezone (Asia/Dhaka) honouring
+//    BUSINESS_DAY_START_HOUR, so after-midnight trade can be attributed to the day before.
+//  * Customers, plans, menu items and users are soft deleted. Financial rows are never
+//    deleted, only voided.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  KIDZONE_MANAGER
+  RESTAURANT_CASHIER
+}
+
+enum Section {
+  KIDZONE
+  RESTAURANT
+}
+
+enum PlanType {
+  MEMBERSHIP
+  SESSION
+}
+
+enum SaleStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum VisitStatus {
+  ACTIVE
+  COMPLETED
+}
+
+enum VerificationMethod {
+  OTP
+  QR
+  GATEPASS
+  MANUAL_OVERRIDE
+}
+
+enum OtpPurpose {
+  CHECK_IN
+  PHONE_VERIFY
+}
+
+enum SmsType {
+  OTP
+  GATEPASS
+  EXPIRY_REMINDER
+  RECEIPT
+  OTHER
+}
+
+enum SmsStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+enum OrderStatus {
+  PAID
+  VOIDED
+}
+
+enum PaymentMethod {
+  CASH
+  BKASH
+  NAGAD
+  CARD
+  OTHER
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Users & auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  name         String
+  phone        String    @unique
+  email        String?   @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime? @db.Timestamptz(6)
+  deletedAt    DateTime? @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @db.Timestamptz(6)
+
+  refreshTokens     RefreshToken[]
+  kidZoneSalesSold  KidZoneSale[]   @relation("KidZoneSaleSoldBy")
+  kidZoneSalesVoid  KidZoneSale[]   @relation("KidZoneSaleVoidedBy")
+  ordersCashier     Order[]         @relation("OrderCashier")
+  ordersVoided      Order[]         @relation("OrderVoidedBy")
+  visitsCheckedIn   Visit[]         @relation("VisitCheckedInBy")
+  visitsCheckedOut  Visit[]         @relation("VisitCheckedOutBy")
+  paymentsReceived  Payment[]
+  dayClosings       DayClosing[]
+  auditLogs         AuditLog[]
+  planPriceChanges  PlanPriceHistory[]
+  menuPriceChanges  MenuItemPriceHistory[]
+
+  @@index([role])
+  @@index([isActive])
+  @@index([createdAt])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz(6)
+  revokedAt DateTime? @db.Timestamptz(6)
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([createdAt])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Customers & children (shared by both sections, keyed by phone)
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  phone     String    @unique
+  email     String?
+  address   String?
+  notes     String?
+  isActive  Boolean   @default(true)
+  deletedAt DateTime? @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+
+  children      Child[]
+  kidZoneSales  KidZoneSale[]
+  memberships   Membership[]
+  visits        Visit[]
+  orders        Order[]
+
+  @@index([name])
+  @@index([isActive])
+  @@index([createdAt])
+  @@map("customers")
+}
+
+model Child {
+  id                    String    @id @default(uuid()) @db.Uuid
+  customerId            String    @db.Uuid
+  name                  String
+  dateOfBirth           DateTime  @db.Date
+  gender                Gender?
+  /// Allergies and anything staff must know during a visit.
+  medicalNotes          String?
+  emergencyContactName  String
+  emergencyContactPhone String
+  isActive              Boolean   @default(true)
+  deletedAt             DateTime? @db.Timestamptz(6)
+  createdAt             DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime  @updatedAt @db.Timestamptz(6)
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  kidZoneSales KidZoneSale[]
+  memberships  Membership[]
+  visits       Visit[]
+
+  @@index([customerId])
+  @@index([name])
+  @@index([createdAt])
+  @@map("children")
+}
+
+// ---------------------------------------------------------------------------
+// Kid Zone catalogue
+// ---------------------------------------------------------------------------
+
+model KidZonePlan {
+  id                   String    @id @default(uuid()) @db.Uuid
+  name                 String
+  type                 PlanType
+  /// Poisha.
+  price                Int
+  /// Membership length in days, e.g. 90 or 180.
+  durationDays         Int?
+  /// Session length in minutes, e.g. 120.
+  sessionMinutes       Int?
+  includesSnackBox     Boolean   @default(false)
+  /// Memberships require OTP/QR verification at the gate.
+  requiresVerification Boolean   @default(false)
+  overtimeBlockMinutes Int?
+  /// Poisha charged per started overtime block.
+  overtimeRatePerBlock Int?
+  gracePeriodMinutes   Int       @default(10)
+  sortOrder            Int       @default(0)
+  isActive             Boolean   @default(true)
+  deletedAt            DateTime? @db.Timestamptz(6)
+  createdAt            DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime  @updatedAt @db.Timestamptz(6)
+
+  sales        KidZoneSale[]
+  memberships  Membership[]
+  priceHistory PlanPriceHistory[]
+
+  @@index([type])
+  @@index([isActive])
+  @@index([createdAt])
+  @@map("kidzone_plans")
+}
+
+model PlanPriceHistory {
+  id          String   @id @default(uuid()) @db.Uuid
+  planId      String   @db.Uuid
+  oldPrice    Int
+  newPrice    Int
+  changedById String   @db.Uuid
+  changedAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  plan      KidZonePlan @relation(fields: [planId], references: [id])
+  changedBy User        @relation(fields: [changedById], references: [id])
+
+  @@index([planId])
+  @@index([changedById])
+  @@index([changedAt])
+  @@map("plan_price_history")
+}
+
+// ---------------------------------------------------------------------------
+// Kid Zone trade
+// ---------------------------------------------------------------------------
+
+model KidZoneSale {
+  id                String     @id @default(uuid()) @db.Uuid
+  receiptNo         String     @unique
+  businessDate      DateTime   @db.Date
+  customerId        String     @db.Uuid
+  childId           String     @db.Uuid
+  planId            String     @db.Uuid
+  /// Frozen at sale time so later catalogue edits never rewrite history.
+  planNameSnapshot  String
+  unitPriceSnapshot Int
+  discountAmount    Int        @default(0)
+  discountReason    String?
+  totalAmount       Int
+  status            SaleStatus @default(COMPLETED)
+  soldById          String     @db.Uuid
+  voidedById        String?    @db.Uuid
+  voidReason        String?
+  voidedAt          DateTime?  @db.Timestamptz(6)
+  createdAt         DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime   @updatedAt @db.Timestamptz(6)
+
+  customer   Customer     @relation(fields: [customerId], references: [id])
+  child      Child        @relation(fields: [childId], references: [id])
+  plan       KidZonePlan  @relation(fields: [planId], references: [id])
+  soldBy     User         @relation("KidZoneSaleSoldBy", fields: [soldById], references: [id])
+  voidedBy   User?        @relation("KidZoneSaleVoidedBy", fields: [voidedById], references: [id])
+  payments   Payment[]
+  membership Membership?
+  visits     Visit[]
+
+  @@index([businessDate])
+  @@index([customerId])
+  @@index([childId])
+  @@index([planId])
+  @@index([soldById])
+  @@index([voidedById])
+  @@index([status])
+  @@index([createdAt])
+  @@index([businessDate, status])
+  @@map("kidzone_sales")
+}
+
+model Membership {
+  id            String           @id @default(uuid()) @db.Uuid
+  customerId    String           @db.Uuid
+  childId       String           @db.Uuid
+  planId        String           @db.Uuid
+  saleId        String           @unique @db.Uuid
+  startDate     DateTime         @db.Date
+  endDate       DateTime         @db.Date
+  status        MembershipStatus @default(ACTIVE)
+  /// Random, unguessable token printed as a QR code for gate check-in.
+  qrToken       String           @unique
+  renewedFromId String?          @unique @db.Uuid
+  createdAt     DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime         @updatedAt @db.Timestamptz(6)
+
+  customer    Customer    @relation(fields: [customerId], references: [id])
+  child       Child       @relation(fields: [childId], references: [id])
+  plan        KidZonePlan @relation(fields: [planId], references: [id])
+  sale        KidZoneSale @relation(fields: [saleId], references: [id])
+  renewedFrom Membership? @relation("MembershipRenewal", fields: [renewedFromId], references: [id])
+  renewedTo   Membership? @relation("MembershipRenewal")
+  visits      Visit[]
+  reminders   ExpiryReminderLog[]
+
+  @@index([customerId])
+  @@index([childId])
+  @@index([planId])
+  @@index([status])
+  @@index([endDate])
+  @@index([createdAt])
+  @@index([status, endDate])
+  @@map("memberships")
+}
+
+model Visit {
+  id                 String             @id @default(uuid()) @db.Uuid
+  businessDate       DateTime           @db.Date
+  customerId         String             @db.Uuid
+  childId            String             @db.Uuid
+  membershipId       String?            @db.Uuid
+  /// Set for one-time SESSION visits, which are created straight from the sale.
+  saleId             String?            @db.Uuid
+  gatepassNo         String             @unique
+  checkInAt          DateTime           @db.Timestamptz(6)
+  expectedCheckOutAt DateTime?          @db.Timestamptz(6)
+  checkOutAt         DateTime?          @db.Timestamptz(6)
+  verificationMethod VerificationMethod
+  overrideReason     String?
+  overtimeMinutes    Int                @default(0)
+  /// Poisha.
+  overtimeCharge     Int                @default(0)
+  status             VisitStatus        @default(ACTIVE)
+  checkedInById      String             @db.Uuid
+  checkedOutById     String?            @db.Uuid
+  createdAt          DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(6)
+
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  child        Child        @relation(fields: [childId], references: [id])
+  membership   Membership?  @relation(fields: [membershipId], references: [id])
+  sale         KidZoneSale? @relation(fields: [saleId], references: [id])
+  checkedInBy  User         @relation("VisitCheckedInBy", fields: [checkedInById], references: [id])
+  checkedOutBy User?        @relation("VisitCheckedOutBy", fields: [checkedOutById], references: [id])
+  payments     Payment[]
+
+  @@index([businessDate])
+  @@index([customerId])
+  @@index([childId])
+  @@index([membershipId])
+  @@index([saleId])
+  @@index([checkedInById])
+  @@index([checkedOutById])
+  @@index([status])
+  @@index([checkInAt])
+  @@index([createdAt])
+  @@index([status, checkInAt])
+  @@map("visits")
+}
+
+// ---------------------------------------------------------------------------
+// OTP & SMS
+// ---------------------------------------------------------------------------
+
+model OtpCode {
+  id         String     @id @default(uuid()) @db.Uuid
+  phone      String
+  purpose    OtpPurpose
+  /// Only the argon2 hash is stored; the plain code never touches the database.
+  codeHash   String
+  expiresAt  DateTime   @db.Timestamptz(6)
+  attempts   Int        @default(0)
+  consumedAt DateTime?  @db.Timestamptz(6)
+  createdAt  DateTime   @default(now()) @db.Timestamptz(6)
+
+  @@index([phone])
+  @@index([phone, purpose])
+  @@index([expiresAt])
+  @@index([createdAt])
+  @@map("otp_codes")
+}
+
+model SmsLog {
+  id                String    @id @default(uuid()) @db.Uuid
+  phone             String
+  type              SmsType
+  message           String
+  provider          String
+  status            SmsStatus @default(QUEUED)
+  providerMessageId String?
+  error             String?
+  attempts          Int       @default(0)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@index([phone])
+  @@index([type])
+  @@index([status])
+  @@index([createdAt])
+  @@map("sms_logs")
+}
+
+/// Makes the daily expiry-reminder job idempotent: one row per membership per
+/// reminder offset, so a re-run on the same day sends nothing twice.
+model ExpiryReminderLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  membershipId String   @db.Uuid
+  daysBefore   Int
+  sentOn       DateTime @db.Date
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@unique([membershipId, daysBefore, sentOn])
+  @@index([membershipId])
+  @@index([sentOn])
+  @@map("expiry_reminder_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Restaurant catalogue
+// ---------------------------------------------------------------------------
+
+model MenuCategory {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String    @unique
+  sortOrder Int       @default(0)
+  isActive  Boolean   @default(true)
+  deletedAt DateTime? @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(6)
+
+  items MenuItem[]
+
+  @@index([isActive])
+  @@index([sortOrder])
+  @@index([createdAt])
+  @@map("menu_categories")
+}
+
+model MenuItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  categoryId  String    @db.Uuid
+  name        String
+  description String?
+  /// Poisha.
+  price       Int
+  sku         String?   @unique
+  /// Temporarily out of stock. Cashiers may toggle this.
+  isAvailable Boolean   @default(true)
+  isActive    Boolean   @default(true)
+  sortOrder   Int       @default(0)
+  deletedAt   DateTime? @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+
+  category     MenuCategory           @relation(fields: [categoryId], references: [id])
+  orderItems   OrderItem[]
+  priceHistory MenuItemPriceHistory[]
+
+  @@index([categoryId])
+  @@index([isActive])
+  @@index([isAvailable])
+  @@index([name])
+  @@index([createdAt])
+  @@map("menu_items")
+}
+
+model MenuItemPriceHistory {
+  id          String   @id @default(uuid()) @db.Uuid
+  menuItemId  String   @db.Uuid
+  oldPrice    Int
+  newPrice    Int
+  changedById String   @db.Uuid
+  changedAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  menuItem  MenuItem @relation(fields: [menuItemId], references: [id])
+  changedBy User     @relation(fields: [changedById], references: [id])
+
+  @@index([menuItemId])
+  @@index([changedById])
+  @@index([changedAt])
+  @@map("menu_item_price_history")
+}
+
+// ---------------------------------------------------------------------------
+// Restaurant trade
+// ---------------------------------------------------------------------------
+
+model Order {
+  id                    String      @id @default(uuid()) @db.Uuid
+  receiptNo             String      @unique
+  businessDate          DateTime    @db.Date
+  customerId            String?     @db.Uuid
+  tableNo               String?
+  subtotal              Int
+  discountAmount        Int         @default(0)
+  discountReason        String?
+  /// Percentages are snapshotted from Settings at order time.
+  vatPercent            Decimal     @db.Decimal(5, 2)
+  vatAmount             Int
+  serviceChargePercent  Decimal     @db.Decimal(5, 2)
+  serviceChargeAmount   Int
+  totalAmount           Int
+  status                OrderStatus @default(PAID)
+  cashierId             String      @db.Uuid
+  voidedById            String?     @db.Uuid
+  voidReason            String?
+  voidedAt              DateTime?   @db.Timestamptz(6)
+  createdAt             DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime    @updatedAt @db.Timestamptz(6)
+
+  customer Customer?   @relation(fields: [customerId], references: [id])
+  cashier  User        @relation("OrderCashier", fields: [cashierId], references: [id])
+  voidedBy User?       @relation("OrderVoidedBy", fields: [voidedById], references: [id])
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([businessDate])
+  @@index([customerId])
+  @@index([cashierId])
+  @@index([voidedById])
+  @@index([status])
+  @@index([createdAt])
+  @@index([businessDate, status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                   String  @id @default(uuid()) @db.Uuid
+  orderId              String  @db.Uuid
+  menuItemId           String  @db.Uuid
+  itemNameSnapshot     String
+  unitPriceSnapshot    Int
+  categoryNameSnapshot String
+  quantity             Int
+  lineTotal            Int
+  note                 String?
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id])
+
+  @@index([orderId])
+  @@index([menuItemId])
+  @@index([itemNameSnapshot])
+  @@map("order_items")
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+/// A payment belongs to exactly one of: a Kid Zone sale, a restaurant order, or
+/// a visit (overtime settled at check-out). The one-parent rule is enforced by a
+/// CHECK constraint added in the initial migration. Several payments per parent
+/// are allowed, which is how split payments work; the service layer verifies the
+/// sum equals the parent total.
+model Payment {
+  id            String        @id @default(uuid()) @db.Uuid
+  method        PaymentMethod
+  /// Poisha.
+  amount        Int
+  /// bKash/Nagad/card transaction id.
+  reference     String?
+  kidZoneSaleId String?       @db.Uuid
+  orderId       String?       @db.Uuid
+  visitId       String?       @db.Uuid
+  receivedById  String        @db.Uuid
+  businessDate  DateTime      @db.Date
+  createdAt     DateTime      @default(now()) @db.Timestamptz(6)
+
+  kidZoneSale KidZoneSale? @relation(fields: [kidZoneSaleId], references: [id])
+  order       Order?       @relation(fields: [orderId], references: [id])
+  visit       Visit?       @relation(fields: [visitId], references: [id])
+  receivedBy  User         @relation(fields: [receivedById], references: [id])
+
+  @@index([kidZoneSaleId])
+  @@index([orderId])
+  @@index([visitId])
+  @@index([receivedById])
+  @@index([businessDate])
+  @@index([method])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Day closing, audit, settings
+// ---------------------------------------------------------------------------
+
+model DayClosing {
+  id               String    @id @default(uuid()) @db.Uuid
+  section          Section
+  businessDate     DateTime  @db.Date
+  expectedCash     Int
+  countedCash      Int
+  /// countedCash - expectedCash. Negative means short.
+  difference       Int
+  /// { CASH: 123400, BKASH: 5000, ... } in poisha.
+  expectedByMethod Json
+  totalSales       Int
+  totalVoids       Int
+  totalDiscounts   Int
+  transactionCount Int
+  notes            String?
+  closedById       String    @db.Uuid
+  closedAt         DateTime  @default(now()) @db.Timestamptz(6)
+  reopenedAt       DateTime? @db.Timestamptz(6)
+  reopenedById     String?   @db.Uuid
+  reopenReason     String?
+
+  closedBy User @relation(fields: [closedById], references: [id])
+
+  @@unique([section, businessDate])
+  @@index([section])
+  @@index([businessDate])
+  @@index([closedById])
+  @@index([closedAt])
+  @@map("day_closings")
+}
+
+/// Append-only. There are deliberately no update or delete endpoints.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @db.Uuid
+  action     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  reason     String?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([actorId])
+  @@index([action])
+  @@index([entityType])
+  @@index([entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Setting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("settings")
+}
+
+/// Backs concurrency-safe, human readable sequence numbers that reset each
+/// business day: receipts (`KZ-20260922-0001`, `RS-20260922-0001`) and
+/// gatepasses (`GP-20260922-0001`).
+///
+/// `scope` is a free-form string rather than an enum so a new numbered document
+/// needs no migration. Incremented with a single atomic
+/// `INSERT … ON CONFLICT DO UPDATE … RETURNING` inside the sale transaction, so
+/// two tills ringing up at the same instant cannot be handed the same number.
+model Counter {
+  scope        String
+  businessDate DateTime @db.Date
+  lastNumber   Int      @default(0)
+
+  @@id([scope, businessDate])
+  @@map("counters")
+}
